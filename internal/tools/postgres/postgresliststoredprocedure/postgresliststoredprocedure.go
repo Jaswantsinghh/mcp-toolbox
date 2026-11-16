@@ -27,6 +27,7 @@ import (
 	"github.com/googleapis/mcp-toolbox/internal/tools"
 	"github.com/googleapis/mcp-toolbox/internal/util"
 	"github.com/googleapis/mcp-toolbox/internal/util/parameters"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -134,6 +135,11 @@ func (t Tool) Invoke(ctx context.Context, s sources.Source, params parameters.Pa
 	}
 	defer results.Close()
 
+	return collectRows(results)
+}
+
+// collectRows converts each row into a map keyed by column name.
+func collectRows(results pgx.Rows) ([]map[string]any, util.ToolboxError) {
 	fields := results.FieldDescriptions()
 	var out []map[string]any
 
@@ -147,6 +153,10 @@ func (t Tool) Invoke(ctx context.Context, s sources.Source, params parameters.Pa
 			rowMap[string(field.Name)] = values[i]
 		}
 		out = append(out, rowMap)
+	}
+	// pgx reports query execution errors here once Next returns false.
+	if err := results.Err(); err != nil {
+		return nil, util.ProcessGeneralError(fmt.Errorf("unable to execute query: %w", err))
 	}
 
 	return out, nil

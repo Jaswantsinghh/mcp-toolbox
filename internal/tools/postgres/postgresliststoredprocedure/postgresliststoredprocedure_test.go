@@ -15,6 +15,7 @@
 package postgresliststoredprocedure_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -22,7 +23,62 @@ import (
 	"github.com/googleapis/mcp-toolbox/internal/testutils"
 	"github.com/googleapis/mcp-toolbox/internal/tools"
 	"github.com/googleapis/mcp-toolbox/internal/tools/postgres/postgresliststoredprocedure"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// fakeRows implements the subset of pgx.Rows used by collectRows.
+type fakeRows struct {
+	pgx.Rows
+	fields []pgconn.FieldDescription
+	rows   [][]any
+	err    error
+	pos    int
+}
+
+func (r *fakeRows) FieldDescriptions() []pgconn.FieldDescription { return r.fields }
+
+func (r *fakeRows) Next() bool {
+	if r.pos >= len(r.rows) {
+		return false
+	}
+	r.pos++
+	return true
+}
+
+func (r *fakeRows) Values() ([]any, error) { return r.rows[r.pos-1], nil }
+
+func (r *fakeRows) Err() error { return r.err }
+
+func TestCollectRows(t *testing.T) {
+	fields := []pgconn.FieldDescription{{Name: "schema_name"}, {Name: "name"}}
+	rows := [][]any{{"public", "proc_a"}, {"public", "proc_b"}}
+
+	t.Run("returns rows", func(t *testing.T) {
+		got, err := postgresliststoredprocedure.CollectRows(&fakeRows{fields: fields, rows: rows})
+		if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+		want := []map[string]any{
+			{"schema_name": "public", "name": "proc_a"},
+			{"schema_name": "public", "name": "proc_b"},
+		}
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Fatalf("incorrect rows: diff %v", diff)
+		}
+	})
+
+	t.Run("returns iteration error", func(t *testing.T) {
+		iterErr := errors.New("canceling statement due to statement timeout")
+		got, err := postgresliststoredprocedure.CollectRows(&fakeRows{fields: fields, rows: rows[:1], err: iterErr})
+		if err == nil {
+			t.Fatalf("expected error, got rows %v", got)
+		}
+		if !errors.Is(err, iterErr) {
+			t.Fatalf("expected error to wrap %q, got %q", iterErr, err)
+		}
+	})
+}
 
 func TestParseFromYamlPostgresListStoredProcedure(t *testing.T) {
 	ctx, err := testutils.ContextWithNewLogger()
