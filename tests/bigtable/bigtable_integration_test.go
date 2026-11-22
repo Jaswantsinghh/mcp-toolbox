@@ -35,6 +35,8 @@ import (
 	"github.com/googleapis/mcp-toolbox/internal/testutils"
 	"github.com/googleapis/mcp-toolbox/internal/util/parameters"
 	"github.com/googleapis/mcp-toolbox/tests"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -199,7 +201,9 @@ func TestBigtableToolEndpoints(t *testing.T) {
 
 	t.Cleanup(func() {
 		t.Logf("Running global cleanup for resourceID: %s", resourceID)
-		tests.CleanupBigtableTables(t, context.Background(), adminClient, resourceID)
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cleanupCancel()
+		tests.CleanupBigtableTables(t, cleanupCtx, adminClient, resourceID)
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Minute)
@@ -267,7 +271,7 @@ func TestBigtableToolEndpoints(t *testing.T) {
 	tests.RunMCPToolCallMethod(t, mcpMyFailToolWant, mcpSelect1Want)
 	runBigTableAdminToolsGetTest(t)
 	if os.Getenv("RUN_EXPENSIVE_TESTS") == "true" {
-		runBigTableAdminToolsTest(t, ctx, sourceConfig["instance"].(string), adminClient, instanceAdminClient)
+		runBigTableAdminToolsTest(t, sourceConfig["instance"].(string), adminClient, instanceAdminClient)
 	} else {
 		t.Log("Skipping expensive Bigtable admin tools tests (RUN_EXPENSIVE_TESTS is not true)")
 	}
@@ -482,8 +486,23 @@ func assertMCPSuccess(t *testing.T, toolName string, args map[string]any) *tests
 	return mcpResp
 }
 
+// registerBigtableCleanup registers a t.Cleanup that deletes a Bigtable
+// resource. It runs with a fresh context (the test's context may already be
+// cancelled), fails the test if the delete fails, and treats NotFound as
+// success so it can be registered before the resource is created.
+func registerBigtableCleanup(t *testing.T, kind, name string, deleteFn func(context.Context) error) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		if err := deleteFn(ctx); err != nil && status.Code(err) != codes.NotFound {
+			t.Errorf("cleanup: failed to delete Bigtable %s %q: %v", kind, name, err)
+		}
+	})
+}
+
 // runBigTableAdminToolsTest verifies all 20 Bigtable admin lifecycle tools for instances, clusters, tables, and logical views.
-func runBigTableAdminToolsTest(t *testing.T, ctx context.Context, instanceId string, adminClient *bigtable.AdminClient, instanceAdminClient *bigtable.InstanceAdminClient) {
+func runBigTableAdminToolsTest(t *testing.T, instanceId string, adminClient *bigtable.AdminClient, instanceAdminClient *bigtable.InstanceAdminClient) {
 	uniqueID := strings.ReplaceAll(uuid.New().String(), "-", "")
 	createdAt := strconv.FormatInt(time.Now().Unix(), 10)
 	tableName := "admin_test_table_" + createdAt + "_" + uniqueID[:8]
@@ -532,6 +551,13 @@ func runBigTableAdminToolsTest(t *testing.T, ctx context.Context, instanceId str
 	// Create test instance for lifecycle tools (createinstance, updateinstance, updatecluster, createcluster, deletecluster, deleteinstance)
 	testInstId := "testi-" + createdAt + "-" + uniqueID[:8]
 	testClusterId1 := "testc1-" + uniqueID[:8]
+	// Register cleanup before creating so that an assertion failure on the
+	// create response (or anything later) can't leak the instance. Deleting
+	// the instance also deletes every cluster in it, including the secondary
+	// cluster created below. NotFound is treated as success.
+	registerBigtableCleanup(t, "instance", testInstId, func(ctx context.Context) error {
+		return instanceAdminClient.DeleteInstance(ctx, testInstId)
+	})
 	createInstResp := assertMCPSuccess(t, "bigtable-create-instance", map[string]any{
 		"instance_id":  testInstId,
 		"display_name": "Test Instance " + uniqueID[:8],
@@ -542,13 +568,6 @@ func runBigTableAdminToolsTest(t *testing.T, ctx context.Context, instanceId str
 	if len(createInstResp.Result.Content) == 0 || !strings.Contains(createInstResp.Result.Content[0].Text, "instance created successfully") {
 		t.Fatalf("bigtable-create-instance unexpected output: %v", createInstResp.Result.Content)
 	}
-	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
-		defer cancel()
-		if err := instanceAdminClient.DeleteInstance(cleanupCtx, testInstId); err != nil {
-			t.Logf("cleanup: failed to delete Bigtable instance %q: %v", testInstId, err)
-		}
-	}()
 
 	// Update instance
 	updateInstResp := assertMCPSuccess(t, "bigtable-update-instance", map[string]any{
@@ -590,7 +609,10 @@ func runBigTableAdminToolsTest(t *testing.T, ctx context.Context, instanceId str
 		t.Fatalf("bigtable-delete-cluster unexpected output: %v", deleteClusterResp.Result.Content)
 	}
 
-	// Create table
+	// Create table. Cleanup is registered first (see instance above).
+	registerBigtableCleanup(t, "table", tableName, func(ctx context.Context) error {
+		return adminClient.DeleteTable(ctx, tableName)
+	})
 	createTableResp := assertMCPSuccess(t, "bigtable-create-table", map[string]any{
 		"table_id":      tableName,
 		"column_family": "cf1",
@@ -598,15 +620,6 @@ func runBigTableAdminToolsTest(t *testing.T, ctx context.Context, instanceId str
 	if len(createTableResp.Result.Content) == 0 || !strings.Contains(createTableResp.Result.Content[0].Text, "table created successfully") {
 		t.Fatalf("bigtable-create-table unexpected output: %v", createTableResp.Result.Content)
 	}
-
-	// Make sure we clean up the table!
-	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
-		defer cancel()
-		if err := adminClient.DeleteTable(cleanupCtx, tableName); err != nil {
-			t.Logf("cleanup: failed to delete Bigtable table %q: %v", tableName, err)
-		}
-	}()
 
 	// Get table
 	getTableResp := assertMCPSuccess(t, "bigtable-get-table", map[string]any{
@@ -631,7 +644,11 @@ func runBigTableAdminToolsTest(t *testing.T, ctx context.Context, instanceId str
 		t.Fatalf("bigtable-list-tables output does not contain expected table %q: %v", tableName, listTablesResp.Result.Content)
 	}
 
-	// Create logical view
+	// Create logical view. Cleanup is registered after the table's, so it runs
+	// first (t.Cleanup is LIFO): a view must be deleted before its table.
+	registerBigtableCleanup(t, "logical view", viewName, func(ctx context.Context) error {
+		return instanceAdminClient.DeleteLogicalView(ctx, instanceId, viewName)
+	})
 	createViewResp := assertMCPSuccess(t, "bigtable-create-logical-view", map[string]any{
 		"instance_id":     instanceId,
 		"logical_view_id": viewName,
@@ -640,15 +657,6 @@ func runBigTableAdminToolsTest(t *testing.T, ctx context.Context, instanceId str
 	if len(createViewResp.Result.Content) == 0 || !strings.Contains(createViewResp.Result.Content[0].Text, "logical view created successfully") {
 		t.Fatalf("bigtable-create-logical-view unexpected output: %v", createViewResp.Result.Content)
 	}
-
-	// Make sure we clean up the view!
-	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
-		defer cancel()
-		if err := instanceAdminClient.DeleteLogicalView(cleanupCtx, instanceId, viewName); err != nil {
-			t.Logf("cleanup: failed to delete Bigtable logical view %q: %v", viewName, err)
-		}
-	}()
 
 	// Get logical view
 	getViewResp := assertMCPSuccess(t, "bigtable-get-logical-view", map[string]any{
