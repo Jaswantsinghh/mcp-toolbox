@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -33,6 +34,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/googleapis/mcp-toolbox/internal/testutils"
 	"github.com/googleapis/mcp-toolbox/tests"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 )
 
@@ -55,6 +57,59 @@ const (
 	largeObjectSize = (8 << 20) + 1024
 )
 
+// testBucketPrefix starts the name of every bucket these tests create, so
+// the TestMain sweeper can find buckets that earlier runs leaked.
+const testBucketPrefix = "toolbox-it-"
+
+// orphanedBucketTTL is how old a test bucket must be before the sweeper
+// deletes it. A test run takes minutes, so a bucket this old cannot belong to
+// a run that is still going.
+const orphanedBucketTTL = 3 * time.Hour
+
+func TestMain(m *testing.M) {
+	// Skip the sweep when no real project is configured or when the storage
+	// client would be pointed at an emulator.
+	if CloudStorageProject != "" && os.Getenv("STORAGE_EMULATOR_HOST") == "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		sweepOrphanedGCSBuckets(ctx, CloudStorageProject)
+		cancel()
+	}
+	os.Exit(m.Run())
+}
+
+// sweepOrphanedGCSBuckets deletes test buckets, and their objects, that are
+// older than orphanedBucketTTL. Failures are only logged: the sweep is a
+// backstop for leaks from earlier runs and must not block this run.
+func sweepOrphanedGCSBuckets(ctx context.Context, project string) {
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		log.Printf("INTEGRATION CLEANUP: failed to create Cloud Storage client: %v", err)
+		return
+	}
+	defer client.Close()
+
+	cutoff := time.Now().Add(-orphanedBucketTTL)
+	it := client.Buckets(ctx, project)
+	it.Prefix = testBucketPrefix
+	for {
+		attrs, err := it.Next()
+		if errors.Is(err, iterator.Done) {
+			return
+		}
+		if err != nil {
+			log.Printf("INTEGRATION CLEANUP: failed to list buckets in project %q: %v", project, err)
+			return
+		}
+		if attrs.Created.IsZero() || attrs.Created.After(cutoff) {
+			continue
+		}
+		log.Printf("INTEGRATION CLEANUP: deleting orphaned bucket %q created %s", attrs.Name, attrs.Created.Format(time.RFC3339))
+		if err := deleteGCSBucket(ctx, client, attrs.Name); err != nil {
+			log.Printf("INTEGRATION CLEANUP: %v", err)
+		}
+	}
+}
+
 func getCloudStorageVars(t *testing.T) map[string]any {
 	if CloudStorageProject == "" {
 		t.Fatal("'CLOUD_STORAGE_PROJECT' not set")
@@ -70,18 +125,13 @@ func TestCloudStorageToolEndpoints(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	client, err := storage.NewClient(ctx)
-	if err != nil {
-		t.Fatalf("unable to create Cloud Storage client: %s", err)
-	}
-	defer client.Close()
+	client := newGCSTestClient(t)
 
 	// Bucket names must be globally unique and match [a-z0-9_.-]{3,63}.
-	bucketName := "toolbox-it-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:20]
+	bucketName := testBucketPrefix + strings.ReplaceAll(uuid.New().String(), "-", "")[:20]
 	t.Logf("Using test bucket %q", bucketName)
 
-	teardown := setupCloudStorageTestData(t, ctx, client, CloudStorageProject, bucketName)
-	defer teardown(t)
+	setupCloudStorageTestData(t, ctx, client, CloudStorageProject, bucketName)
 
 	configuredDownloadDir := t.TempDir()
 	toolsFile := getCloudStorageToolsConfig(sourceConfig, bucketName, configuredDownloadDir)
@@ -841,8 +891,8 @@ func TestCloudStorageToolEndpoints(t *testing.T) {
 	runCloudStorageListBucketsTest(t, bucketName)
 	runCloudStorageGetObjectMetadataTest(t, bucketName)
 	runCloudStorageConfiguredParamsTest(ctx, t, client, bucketName, configuredDownloadDir)
-	bucketToolName := "toolbox-it-bucket-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:17]
-	defer cleanupGCSBucket(ctx, t, client, bucketToolName)
+	bucketToolName := testBucketPrefix + "bucket-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:17]
+	registerGCSBucketCleanup(t, client, bucketToolName)
 	runCloudStorageCreateBucketTest(ctx, t, client, bucketToolName)
 	runCloudStorageGetBucketMetadataTest(t, bucketToolName)
 	runCloudStorageGetBucketIAMPolicyTest(t, bucketToolName)
@@ -1024,16 +1074,22 @@ func getCloudStorageToolsConfig(sourceConfig map[string]any, bucketName, configu
 	}
 }
 
-func setupCloudStorageTestData(t *testing.T, ctx context.Context, client *storage.Client, project, bucket string) func(*testing.T) {
+// setupCloudStorageTestData creates bucket and seeds the objects the tool tests
+// read. Cleanup is registered before the bucket is created, so a failed seed
+// write still deletes the bucket and anything already written to it.
+func setupCloudStorageTestData(t *testing.T, ctx context.Context, client *storage.Client, project, bucket string) {
+	t.Helper()
+	registerGCSBucketCleanup(t, client, bucket)
+
 	bkt := client.Bucket(bucket)
 	if err := bkt.Create(ctx, project, &storage.BucketAttrs{Location: "US"}); err != nil {
 		t.Fatalf("failed to create bucket %q: %v", bucket, err)
 	}
 
-	writeSeed := func(name, contentType, body string) {
+	writeSeed := func(name, contentType string, body []byte) {
 		w := bkt.Object(name).NewWriter(ctx)
 		w.ContentType = contentType
-		if _, err := io.WriteString(w, body); err != nil {
+		if _, err := w.Write(body); err != nil {
 			_ = w.Close()
 			t.Fatalf("failed to write seed object %q: %v", name, err)
 		}
@@ -1042,57 +1098,14 @@ func setupCloudStorageTestData(t *testing.T, ctx context.Context, client *storag
 		}
 	}
 
-	writeSeed(helloObject, "text/plain", helloBody)
-	writeSeed(jsonObject, "application/json", jsonBody)
-	writeSeed(downloadObject, "text/plain", downloadBody)
-
-	// Seed an oversize object to exercise the read-size cap.
-	large := bytes.Repeat([]byte{'A'}, largeObjectSize)
-	lw := bkt.Object(largeObject).NewWriter(ctx)
-	lw.ContentType = "application/octet-stream"
-	if _, err := lw.Write(large); err != nil {
-		_ = lw.Close()
-		t.Fatalf("failed to write seed object %q: %v", largeObject, err)
-	}
-	if err := lw.Close(); err != nil {
-		t.Fatalf("failed to close writer for seed object %q: %v", largeObject, err)
-	}
-
-	// Seed a small binary (non-UTF-8) object to exercise the
-	// ErrBinaryContent path on read_object.
-	binary := []byte{0xff, 0xfe, 0xfd, 0xfc}
-	bw := bkt.Object(binaryObject).NewWriter(ctx)
-	bw.ContentType = "application/octet-stream"
-	if _, err := bw.Write(binary); err != nil {
-		_ = bw.Close()
-		t.Fatalf("failed to write seed object %q: %v", binaryObject, err)
-	}
-	if err := bw.Close(); err != nil {
-		t.Fatalf("failed to close writer for seed object %q: %v", binaryObject, err)
-	}
-
-	return func(t *testing.T) {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-
-		it := bkt.Objects(cleanupCtx, nil)
-		for {
-			attrs, err := it.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				t.Logf("cleanup: iterator error, aborting object delete loop: %v", err)
-				break
-			}
-			if delErr := bkt.Object(attrs.Name).Delete(cleanupCtx); delErr != nil {
-				t.Logf("cleanup: failed to delete object %q: %v", attrs.Name, delErr)
-			}
-		}
-		if err := bkt.Delete(cleanupCtx); err != nil {
-			t.Logf("cleanup: failed to delete bucket %q: %v", bucket, err)
-		}
-	}
+	writeSeed(helloObject, "text/plain", []byte(helloBody))
+	writeSeed(jsonObject, "application/json", []byte(jsonBody))
+	writeSeed(downloadObject, "text/plain", []byte(downloadBody))
+	// An oversize object exercises the read-size cap.
+	writeSeed(largeObject, "application/octet-stream", bytes.Repeat([]byte{'A'}, largeObjectSize))
+	// A small binary (non-UTF-8) object exercises the ErrBinaryContent path
+	// on read_object.
+	writeSeed(binaryObject, "application/octet-stream", []byte{0xff, 0xfe, 0xfd, 0xfc})
 }
 
 // invokeTool POSTs to the tool invoke endpoint and returns the parsed `result`
@@ -1640,8 +1653,8 @@ func runCloudStorageConfiguredParamsTest(ctx context.Context, t *testing.T, clie
 	})
 
 	t.Run("create_bucket uses configured project, location and uniform access", func(t *testing.T) {
-		newBucket := "toolbox-it-cfg-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:17]
-		defer cleanupGCSBucket(ctx, t, client, newBucket)
+		newBucket := testBucketPrefix + "cfg-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:17]
+		registerGCSBucketCleanup(t, client, newBucket)
 
 		body := fmt.Sprintf(`{"bucket": %q}`, newBucket)
 		result, status := invokeTool(t, "my_create_bucket_configured", body)
@@ -2288,30 +2301,74 @@ func gcsBucketExists(t *testing.T, ctx context.Context, client *storage.Client, 
 	return false
 }
 
-func cleanupGCSBucket(ctx context.Context, t *testing.T, client *storage.Client, bucket string) {
+// newGCSTestClient returns a Cloud Storage client that stays usable for the
+// whole test, including its cleanups. It is built from context.Background()
+// rather than the test's deadline-bound context, and it is closed by a
+// t.Cleanup registered before any bucket cleanup, so it closes only after
+// those cleanups have run.
+func newGCSTestClient(t *testing.T) *storage.Client {
 	t.Helper()
-	cleanupCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
+	client, err := storage.NewClient(context.Background())
+	if err != nil {
+		t.Fatalf("unable to create Cloud Storage client: %s", err)
+	}
+	t.Cleanup(func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("failed to close Cloud Storage client: %v", err)
+		}
+	})
+	return client
+}
 
+// registerGCSBucketCleanup registers a t.Cleanup that deletes bucket and every
+// object in it. Register it before the bucket is created, so a failure at any
+// later point still removes the bucket. The cleanup uses its own context, so
+// it still runs after the test's context has expired, and it fails the test
+// when the bucket cannot be removed. A bucket that was never created or is
+// already gone counts as cleaned up.
+func registerGCSBucketCleanup(t *testing.T, client *storage.Client, bucket string) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := deleteGCSBucket(ctx, client, bucket); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
+}
+
+// deleteGCSBucket deletes every object in bucket and then the bucket itself.
+// Objects or a bucket that no longer exist are not errors.
+func deleteGCSBucket(ctx context.Context, client *storage.Client, bucket string) error {
 	bkt := client.Bucket(bucket)
-	it := bkt.Objects(cleanupCtx, nil)
+	var errs []error
+	it := bkt.Objects(ctx, nil)
 	for {
 		attrs, err := it.Next()
-		if err == iterator.Done {
+		if errors.Is(err, iterator.Done) {
 			break
 		}
 		if err != nil {
-			if errors.Is(err, storage.ErrBucketNotExist) {
-				return
+			if isGCSNotFound(err) {
+				return nil
 			}
-			t.Logf("cleanup: failed listing bucket %q: %v", bucket, err)
-			break
+			return fmt.Errorf("failed listing objects in bucket %q: %w", bucket, err)
 		}
-		if delErr := bkt.Object(attrs.Name).Delete(cleanupCtx); delErr != nil {
-			t.Logf("cleanup: failed deleting object %q from bucket %q: %v", attrs.Name, bucket, delErr)
+		if err := bkt.Object(attrs.Name).Delete(ctx); err != nil && !isGCSNotFound(err) {
+			errs = append(errs, fmt.Errorf("failed deleting object %q from bucket %q: %w", attrs.Name, bucket, err))
 		}
 	}
-	if err := bkt.Delete(cleanupCtx); err != nil && !errors.Is(err, storage.ErrBucketNotExist) {
-		t.Logf("cleanup: failed deleting bucket %q: %v", bucket, err)
+	if err := bkt.Delete(ctx); err != nil && !isGCSNotFound(err) {
+		errs = append(errs, fmt.Errorf("failed deleting bucket %q: %w", bucket, err))
 	}
+	return errors.Join(errs...)
+}
+
+// isGCSNotFound reports whether err means the bucket or object does not exist.
+func isGCSNotFound(err error) bool {
+	if errors.Is(err, storage.ErrBucketNotExist) || errors.Is(err, storage.ErrObjectNotExist) {
+		return true
+	}
+	var apiErr *googleapi.Error
+	return errors.As(err, &apiErr) && apiErr.Code == http.StatusNotFound
 }
