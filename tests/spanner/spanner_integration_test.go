@@ -27,7 +27,6 @@ import (
 
 	"cloud.google.com/go/spanner"
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
-	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	"github.com/google/uuid"
 	"github.com/googleapis/mcp-toolbox/internal/testutils"
 	"github.com/googleapis/mcp-toolbox/tests"
@@ -71,6 +70,7 @@ func initSpannerClients(ctx context.Context, project, instance, dbname string) (
 	// Create Spanner admin client (for creating databases)
 	adminClient, err := database.NewDatabaseAdminClient(ctx)
 	if err != nil {
+		dataClient.Close()
 		return nil, nil, fmt.Errorf("unable to create new Spanner admin client: %w", err)
 	}
 
@@ -89,6 +89,10 @@ func TestSpannerToolEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unable to create Spanner client: %s", err)
 	}
+	// Deferred before the table teardowns, so the clients are closed only
+	// after every teardown (which uses adminClient) has run.
+	defer dataClient.Close()
+	defer adminClient.Close()
 
 	// create table name with UUID
 	tableNameParam := "param_table_" + strings.ReplaceAll(uuid.New().String(), "-", "")
@@ -274,55 +278,23 @@ func addSpannerSearchCatalogConfig(t *testing.T, config map[string]any) map[stri
 	return config
 }
 
-// setupSpannerPgVectorTable creates a vector table in Spanner (PostgreSQL dialect) for semantic search testing
-func setupSpannerPgVectorTable(t *testing.T, ctx context.Context, adminClient *database.DatabaseAdminClient, dbString string) (string, func(*testing.T)) {
-	tableName := "vector_table_" + strings.ReplaceAll(uuid.New().String(), "-", "")
-	createStatement := fmt.Sprintf(`CREATE TABLE %s (
-		id bigint PRIMARY KEY,
-		content text,
-		embedding float4[]
-	)`, tableName)
-
-	op, err := adminClient.UpdateDatabaseDdl(ctx, &databasepb.UpdateDatabaseDdlRequest{
-		Database:   dbString,
-		Statements: []string{createStatement},
-	})
-	if err != nil {
-		t.Fatalf("unable to start create vector table operation %s: %s", tableName, err)
+// getSpannerPgDatabase returns the PostgreSQL-dialect database the PG test
+// runs against. The test doesn't create this database, so it must already
+// exist in SPANNER_INSTANCE.
+func getSpannerPgDatabase(t *testing.T) string {
+	switch "" {
+	case SpannerProject:
+		t.Fatal("'SPANNER_PROJECT' not set")
+	case SpannerInstance:
+		t.Fatal("'SPANNER_INSTANCE' not set")
+	case SpannerPgDatabase:
+		t.Fatal("'SPANNER_PG_DATABASE' not set: it must name an existing PostgreSQL-dialect database in SPANNER_INSTANCE")
 	}
-	err = op.Wait(ctx)
-	if err != nil {
-		t.Fatalf("unable to create test vector table %s: %s", tableName, err)
-	}
-
-	return tableName, func(t *testing.T) {
-		op, err = adminClient.UpdateDatabaseDdl(ctx, &databasepb.UpdateDatabaseDdlRequest{
-			Database:   dbString,
-			Statements: []string{fmt.Sprintf("DROP TABLE IF EXISTS %s", tableName)},
-		})
-		if err != nil {
-			t.Errorf("unable to start drop %s operation: %s", tableName, err)
-			return
-		}
-		opErr := op.Wait(ctx)
-		if opErr != nil {
-			t.Errorf("Teardown failed: %s", opErr)
-		}
-	}
-}
-
-// getSpannerPgVectorSearchStmts returns statements for spanner semantic search (PostgreSQL dialect)
-func getSpannerPgVectorSearchStmts(vectorTableName string) (string, string) {
-	insertStmt := fmt.Sprintf("INSERT INTO %s (id, content, embedding) VALUES (1, $1, $2)", vectorTableName)
-	searchStmt := fmt.Sprintf("SELECT id, content, spanner.cosine_distance(embedding, $1::float4[]) AS distance FROM %s ORDER BY distance LIMIT 1", vectorTableName)
-	return insertStmt, searchStmt
+	return SpannerPgDatabase
 }
 
 func TestSpannerPostgresqlToolEndpoints(t *testing.T) {
-	// Skip if environment variables are not set
-	if SpannerProject == "" || SpannerInstance == "" {
-		t.Skip("SPANNER_PROJECT or SPANNER_INSTANCE not set, skipping PostgreSQL tests")
-	}
+	dbName := getSpannerPgDatabase(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
@@ -334,10 +306,6 @@ func TestSpannerPostgresqlToolEndpoints(t *testing.T) {
 	}
 	defer adminClient.Close()
 
-	dbName := SpannerPgDatabase
-	if dbName == "" {
-		dbName = "pg_test_database"
-	}
 	t.Logf("Using PostgreSQL database: %s", dbName)
 
 	dbString := fmt.Sprintf("projects/%s/instances/%s/databases/%s", SpannerProject, SpannerInstance, dbName)

@@ -19,6 +19,7 @@ package spanner
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -96,9 +97,10 @@ func getSpannerOmniVars(endpoint, dbName string) map[string]any {
 	}
 }
 
-// initSpannerOmniClients creates the database and returns clients for it.
-// Nothing is dropped afterwards because the container is discarded.
-func initSpannerOmniClients(ctx context.Context, t *testing.T, endpoint, dbName string) (*spanner.Client, *database.DatabaseAdminClient, string, func()) {
+// initSpannerOmniClients creates a database with the given dialect and returns
+// clients for it. Nothing is dropped afterwards because the container is
+// discarded.
+func initSpannerOmniClients(ctx context.Context, t *testing.T, endpoint, dbName string, dialect databasepb.DatabaseDialect) (*spanner.Client, *database.DatabaseAdminClient, string, func()) {
 	t.Helper()
 	config := spanner.ClientConfig{Type: spanner.OMNI, UsePlainText: true}
 	opt := option.WithEndpoint(endpoint)
@@ -107,9 +109,15 @@ func initSpannerOmniClients(ctx context.Context, t *testing.T, endpoint, dbName 
 	if err != nil {
 		t.Fatalf("unable to create Spanner Omni admin client: %s", err)
 	}
+	// GoogleSQL quotes identifiers with backticks, PostgreSQL with double quotes.
+	createStatement := fmt.Sprintf("CREATE DATABASE `%s`", dbName)
+	if dialect == databasepb.DatabaseDialect_POSTGRESQL {
+		createStatement = fmt.Sprintf(`CREATE DATABASE "%s"`, dbName)
+	}
 	op, err := adminClient.CreateDatabase(ctx, &databasepb.CreateDatabaseRequest{
 		Parent:          "projects/default/instances/default",
-		CreateStatement: fmt.Sprintf("CREATE DATABASE `%s`", dbName),
+		CreateStatement: createStatement,
+		DatabaseDialect: dialect,
 	})
 	if err != nil {
 		adminClient.Close()
@@ -155,7 +163,7 @@ func TestSpannerOmniToolEndpoints(t *testing.T) {
 	// The container is discarded at the end, so the database, tables, and
 	// graph below aren't torn down individually.
 	dbName := "omni_test_db"
-	dataClient, adminClient, dbString, closeClients := initSpannerOmniClients(ctx, t, endpoint, dbName)
+	dataClient, adminClient, dbString, closeClients := initSpannerOmniClients(ctx, t, endpoint, dbName, databasepb.DatabaseDialect_GOOGLE_STANDARD_SQL)
 	defer closeClients()
 	sourceConfig := getSpannerOmniVars(endpoint, dbName)
 
@@ -294,6 +302,203 @@ func runSpannerOmniSearchCatalogTest(t *testing.T) {
 		api := "http://127.0.0.1:5000/api/tool/my-search-catalog-tool/invoke"
 		resp, respBody := tests.RunRequest(t, http.MethodPost, api, bytes.NewBuffer([]byte(`{"prompt":"table"}`)), nil)
 		want := "search catalog is not supported for Spanner Omni sources"
+		if !strings.Contains(string(respBody), want) {
+			t.Fatalf("expected %q, got %d: %s", want, resp.StatusCode, respBody)
+		}
+	})
+}
+
+// TestSpannerOmniPostgresqlToolEndpoints covers the PostgreSQL dialect against
+// a Spanner Omni container: positional ($n) parameters in spanner-sql,
+// spanner-execute-sql, the PostgreSQL branch of spanner-list-tables, the
+// GoogleSQL-only check in spanner-list-graphs, and (with API_KEY) semantic
+// search.
+func TestSpannerOmniPostgresqlToolEndpoints(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	endpoint, cleanupContainer := setupSpannerOmniContainer(ctx, t)
+	defer cleanupContainer()
+
+	// The container is discarded at the end, so the database and tables below
+	// aren't torn down individually.
+	dbName := "omni_pg_test_db"
+	dataClient, adminClient, dbString, closeClients := initSpannerOmniClients(ctx, t, endpoint, dbName, databasepb.DatabaseDialect_POSTGRESQL)
+	defer closeClients()
+	sourceConfig := getSpannerOmniVars(endpoint, dbName)
+	sourceConfig["dialect"] = "postgresql"
+
+	tableNameParam := "param_table_" + strings.ReplaceAll(uuid.New().String(), "-", "")
+	tableNameAuth := "auth_table_" + strings.ReplaceAll(uuid.New().String(), "-", "")
+	tableNameTemplateParam := "template_param_table_" + strings.ReplaceAll(uuid.New().String(), "-", "")
+
+	setupSpannerTable(t, ctx, adminClient, dataClient,
+		fmt.Sprintf("CREATE TABLE %s (id bigint PRIMARY KEY, name varchar)", tableNameParam),
+		fmt.Sprintf("INSERT INTO %s (id, name) VALUES (1, $1), (2, $2), (3, $3), (4, NULL)", tableNameParam),
+		tableNameParam, dbString,
+		// The Go client binds PostgreSQL positional parameters as p1, p2, ...
+		map[string]any{"p1": "Alice", "p2": "Jane", "p3": "Sid"},
+	)
+	setupSpannerTable(t, ctx, adminClient, dataClient,
+		fmt.Sprintf("CREATE TABLE %s (id bigint PRIMARY KEY, name varchar, email varchar)", tableNameAuth),
+		"", tableNameAuth, dbString, nil,
+	)
+	setupSpannerTable(t, ctx, adminClient, dataClient,
+		fmt.Sprintf("CREATE TABLE %s (id bigint PRIMARY KEY, name varchar, age bigint)", tableNameTemplateParam),
+		"", tableNameTemplateParam, dbString, nil,
+	)
+
+	toolsFile := map[string]any{
+		"sources": map[string]any{"my-instance": sourceConfig},
+		"tools": map[string]any{
+			"my-pg-tool": map[string]any{
+				"type":        SpannerToolType,
+				"source":      "my-instance",
+				"description": "Tool with PostgreSQL positional parameters",
+				"statement":   fmt.Sprintf("SELECT * FROM %s WHERE id = $1 OR name = $2 ORDER BY id", tableNameParam),
+				"parameters": []any{
+					map[string]any{"name": "id", "type": "integer", "description": "user ID"},
+					map[string]any{"name": "name", "type": "string", "description": "user name"},
+				},
+			},
+			"my-exec-sql-tool-read-only": map[string]any{
+				"type":        "spanner-execute-sql",
+				"source":      "my-instance",
+				"description": "Tool to execute sql",
+				"readOnly":    true,
+			},
+			"my-exec-sql-tool": map[string]any{
+				"type":        "spanner-execute-sql",
+				"source":      "my-instance",
+				"description": "Tool to execute sql",
+			},
+		},
+	}
+	toolsFile = addSpannerListTablesConfig(t, toolsFile)
+	toolsFile = addSpannerListGraphsConfig(t, toolsFile)
+
+	// Semantic search needs a Gemini API key for the embedding model.
+	runSemanticSearch := os.Getenv("API_KEY") != ""
+	if runSemanticSearch {
+		vectorTableName, _ := setupSpannerPgVectorTable(t, ctx, adminClient, dbString)
+		insertStmt, searchStmt := getSpannerPgVectorSearchStmts(vectorTableName)
+		toolsFile = tests.AddSemanticSearchConfig(t, toolsFile, SpannerToolType, insertStmt, searchStmt)
+	}
+
+	cmd, cleanup, err := tests.StartCmd(ctx, toolsFile, "--enable-api")
+	if err != nil {
+		t.Fatalf("command initialization returned an error: %s", err)
+	}
+	defer cleanup()
+
+	waitCtx, cancelWait := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelWait()
+	out, err := testutils.WaitForString(waitCtx, regexp.MustCompile(`Server ready to serve`), cmd.Out)
+	if err != nil {
+		t.Logf("toolbox command logs: \n%s", out)
+		t.Fatalf("toolbox didn't start successfully: %s", err)
+	}
+
+	runSpannerOmniPgInvokeTest(t, tableNameParam)
+	runSpannerListTablesTest(t, tableNameParam, tableNameAuth, tableNameTemplateParam)
+	runSpannerOmniPgListGraphsTest(t)
+	if runSemanticSearch {
+		tests.RunSemanticSearchToolInvokeTest(t, "[]", "", "The quick brown fox")
+	}
+}
+
+func runSpannerOmniPgInvokeTest(t *testing.T, tableNameParam string) {
+	invokeParamWant := `[{"id":"1","name":"Alice"},{"id":"3","name":"Sid"}]`
+	invokeTcs := []struct {
+		name  string
+		tool  string
+		body  string
+		want  string
+		isErr bool
+	}{
+		{
+			name: "invoke my-pg-tool",
+			tool: "my-pg-tool",
+			body: `{"id": 3, "name": "Alice"}`,
+			want: invokeParamWant,
+		},
+		{
+			name: "invoke my-pg-tool with null column",
+			tool: "my-pg-tool",
+			body: `{"id": 4, "name": "nobody"}`,
+			want: `[{"id":"4","name":null}]`,
+		},
+		{
+			name:  "invoke my-pg-tool without parameters",
+			tool:  "my-pg-tool",
+			body:  `{}`,
+			isErr: true,
+		},
+		{
+			name: "invoke my-exec-sql-tool-read-only",
+			tool: "my-exec-sql-tool-read-only",
+			body: fmt.Sprintf(`{"sql":"SELECT * FROM %s WHERE id = 3 OR name = 'Alice' ORDER BY id"}`, tableNameParam),
+			want: invokeParamWant,
+		},
+		{
+			name:  "invoke my-exec-sql-tool-read-only insert entry",
+			tool:  "my-exec-sql-tool-read-only",
+			body:  fmt.Sprintf(`{"sql":"INSERT INTO %s (id, name) VALUES (5, 'test_name')"}`, tableNameParam),
+			isErr: true,
+		},
+		{
+			name: "invoke my-exec-sql-tool insert entry",
+			tool: "my-exec-sql-tool",
+			body: fmt.Sprintf(`{"sql":"INSERT INTO %s (id, name) VALUES (5, 'test_name')"}`, tableNameParam),
+			want: "[]",
+		},
+		{
+			name: "invoke my-exec-sql-tool select inserted entry",
+			tool: "my-exec-sql-tool",
+			body: fmt.Sprintf(`{"sql":"SELECT * FROM %s WHERE id = 5"}`, tableNameParam),
+			want: `[{"id":"5","name":"test_name"}]`,
+		},
+	}
+	for _, tc := range invokeTcs {
+		t.Run(tc.name, func(t *testing.T) {
+			api := fmt.Sprintf("http://127.0.0.1:5000/api/tool/%s/invoke", tc.tool)
+			resp, respBody := tests.RunRequest(t, http.MethodPost, api, bytes.NewBufferString(tc.body), nil)
+			if resp.StatusCode != http.StatusOK {
+				if tc.isErr {
+					return
+				}
+				t.Fatalf("response status code is not 200, got %d: %s", resp.StatusCode, respBody)
+			}
+
+			var body map[string]any
+			if err := json.Unmarshal(respBody, &body); err != nil {
+				t.Fatalf("error parsing response body: %s", err)
+			}
+			got, ok := body["result"].(string)
+			if !ok {
+				t.Fatalf("unable to find result in response body: %s", respBody)
+			}
+
+			// Database errors are returned with a 200 status and an error in
+			// the result.
+			if tc.isErr {
+				if !strings.Contains(got, `"error"`) {
+					t.Fatalf("expected an error, got %q", got)
+				}
+				return
+			}
+			if got != tc.want {
+				t.Fatalf("unexpected value: got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func runSpannerOmniPgListGraphsTest(t *testing.T) {
+	t.Run("list graphs is not supported for PostgreSQL", func(t *testing.T) {
+		api := "http://127.0.0.1:5000/api/tool/list-graphs-tool/invoke"
+		resp, respBody := tests.RunRequest(t, http.MethodPost, api, bytes.NewBufferString(`{}`), nil)
+		want := "only available for GoogleSQL dialect databases"
 		if !strings.Contains(string(respBody), want) {
 			t.Fatalf("expected %q, got %d: %s", want, resp.StatusCode, respBody)
 		}
