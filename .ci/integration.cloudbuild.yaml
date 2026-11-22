@@ -592,6 +592,7 @@ steps:
       - "SPANNER_PROJECT=$PROJECT_ID"
       - "SPANNER_DATABASE=$_DATABASE_NAME"
       - "SPANNER_INSTANCE=$_SPANNER_INSTANCE"
+      - "SPANNER_PG_DATABASE=$_SPANNER_PG_DATABASE"
       - "SERVICE_ACCOUNT_EMAIL=$SERVICE_ACCOUNT_EMAIL"
     secretEnv: ["CLIENT_ID", "API_KEY"]
     volumes:
@@ -607,7 +608,7 @@ steps:
           .ci/test_with_coverage.sh \
             "Spanner" \
             spanner \
-            spanner || echo "Integration tests failed."
+            spanner
         else
           echo "No relevant changes for Spanner. Skipping shard."
           exit 0
@@ -1821,6 +1822,9 @@ substitutions:
   _POSTGRES_HOST: 127.0.0.1
   _POSTGRES_PORT: "5432"
   _SPANNER_INSTANCE: "spanner-testing"
+  # Pre-existing PostgreSQL-dialect database in _SPANNER_INSTANCE, used by
+  # TestSpannerPostgresqlToolEndpoints (the test doesn't create it).
+  _SPANNER_PG_DATABASE: "pg_test_database"
   _NEO4J_DATABASE: "neo4j"
   _CLOUD_SQL_MSSQL_INSTANCE: "cloud-sql-mssql-testing"
   _CLOUD_SQL_MYSQL_INSTANCE: "cloud-sql-mysql-testing"
