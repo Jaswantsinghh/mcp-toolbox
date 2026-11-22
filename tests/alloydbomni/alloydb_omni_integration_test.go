@@ -98,6 +98,7 @@ func TestAlloyDBOmni(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unable to create alloydb connection pool: %s", err)
 	}
+	defer pool.Close()
 
 	cmd, cleanup, err := tests.StartCmd(ctx, map[string]any{}, args...)
 	if err != nil {
@@ -148,4 +149,89 @@ func TestAlloyDBOmni(t *testing.T) {
 		"list_columnar_recommended_columns": `{}`,
 	}
 	tests.RunStatementToolsTest(t, toolsToTest)
+}
+
+// TestAlloyDBOmniToolEndpoints runs the engine-level postgres-sql,
+// postgres-execute-sql, template-parameter, semantic-search and list_tables
+// subtests against an AlloyDB Omni container through a "postgres" source.
+// tests/alloydbpg runs the same subtests against a shared managed AlloyDB
+// instance; running them here as well gives container-backed coverage that is
+// isolated per run. Connector, IAM, IP-type and read-only enforcement tests
+// need real AlloyDB and stay in tests/alloydbpg.
+func TestAlloyDBOmniToolEndpoints(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	host, port, containerCleanup := setupAlloyDBContainer(ctx, t)
+	// Registered first so it runs after every cleanup that uses the database.
+	t.Cleanup(containerCleanup)
+
+	pool, err := initPostgresConnectionPool(host, port, AlloyDBUser, AlloyDBPass, AlloyDBDatabase)
+	if err != nil {
+		t.Fatalf("unable to create alloydb connection pool: %s", err)
+	}
+	t.Cleanup(pool.Close)
+
+	uniqueID := strings.ReplaceAll(uuid.New().String(), "-", "")
+	t.Cleanup(func() {
+		tests.CleanupPostgresTables(t, context.Background(), pool, uniqueID)
+	})
+
+	tableNameParam := "param_table_" + uniqueID
+	tableNameAuth := "auth_table_" + uniqueID
+	tableNameTemplateParam := "template_param_table_" + uniqueID
+	tableNameExecSql := "exec_sql_table_" + uniqueID
+
+	createParamTableStmt, insertParamTableStmt, paramToolStmt, idParamToolStmt, nameParamToolStmt, arrayToolStmt, paramTestParams := tests.GetPostgresSQLParamToolInfo(tableNameParam)
+	teardownTable1 := tests.SetupPostgresSQLTable(t, ctx, pool, createParamTableStmt, insertParamTableStmt, tableNameParam, paramTestParams)
+	defer teardownTable1(t)
+
+	createAuthTableStmt, insertAuthTableStmt, authToolStmt, authTestParams := tests.GetPostgresSQLAuthToolInfo(tableNameAuth)
+	teardownTable2 := tests.SetupPostgresSQLTable(t, ctx, pool, createAuthTableStmt, insertAuthTableStmt, tableNameAuth, authTestParams)
+	defer teardownTable2(t)
+
+	// AlloyDB Omni ships pgvector, so the semantic search tools can run here.
+	vectorTableName, tearDownVectorTable := tests.SetupPostgresVectorTable(t, ctx, pool)
+	defer tearDownVectorTable(t)
+
+	sourceConfig := map[string]any{
+		"type":     "postgres",
+		"host":     host,
+		"port":     port,
+		"database": AlloyDBDatabase,
+		"user":     AlloyDBUser,
+		"password": AlloyDBPass,
+	}
+	toolsFile := tests.GetToolsConfig(sourceConfig, "postgres-sql", paramToolStmt, idParamToolStmt, nameParamToolStmt, arrayToolStmt, authToolStmt)
+	toolsFile = tests.AddExecuteSqlConfig(t, toolsFile, "postgres-execute-sql")
+	tmplSelectCombined, tmplSelectFilterCombined := tests.GetPostgresSQLTmplToolStatement()
+	toolsFile = tests.AddTemplateParamConfig(t, toolsFile, "postgres-sql", tmplSelectCombined, tmplSelectFilterCombined, "")
+	toolsFile = tests.AddPostgresPrebuiltConfig(t, toolsFile)
+	insertStmt, searchStmt := tests.GetPostgresVectorSearchStmts(vectorTableName)
+	toolsFile = tests.AddSemanticSearchConfig(t, toolsFile, "postgres-sql", insertStmt, searchStmt)
+
+	cmd, cleanup, err := tests.StartCmd(ctx, toolsFile, "--enable-api")
+	if err != nil {
+		t.Fatalf("command initialization returned an error: %s", err)
+	}
+	defer cleanup()
+
+	waitCtx, waitCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer waitCancel()
+	out, err := testutils.WaitForString(waitCtx, regexp.MustCompile(`Server ready to serve`), cmd.Out)
+	if err != nil {
+		t.Logf("toolbox command logs: \n%s", out)
+		t.Fatalf("toolbox didn't start successfully: %s", err)
+	}
+
+	select1Want, mcpMyFailToolWant, _, mcpSelect1Want := tests.GetPostgresWants()
+	createTableStatement := tests.GetPostgresExecuteSqlCreateTableStatement(tableNameExecSql)
+
+	tests.RunToolGetTest(t)
+	tests.RunToolInvokeTest(t, select1Want)
+	tests.RunMCPToolCallMethod(t, mcpMyFailToolWant, mcpSelect1Want)
+	tests.RunExecuteSqlToolInvokeTest(t, createTableStatement, select1Want, tests.WithExecuteSqlTableName(tableNameExecSql))
+	tests.RunToolInvokeWithTemplateParameters(t, tableNameTemplateParam)
+	tests.RunPostgresListTablesTest(t, tableNameParam, tableNameAuth, AlloyDBUser)
+	tests.RunSemanticSearchToolInvokeTest(t, "[]", "", "The quick brown fox")
 }

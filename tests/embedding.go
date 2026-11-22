@@ -242,11 +242,14 @@ func SetupPostgresVectorTable(t *testing.T, ctx context.Context, pool *pgxpool.P
 		t.Fatalf("failed to create table %s: %v", tableName, err)
 	}
 
-	return tableName, func(t *testing.T) {
-		if _, err := pool.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", tableName)); err != nil {
+	// Detached ctx: the caller's ctx may have expired by the time teardown
+	// runs, and the table name does not match the per-run cleanup sweep.
+	teardown := RegisterTeardown(t, func() {
+		if _, err := pool.Exec(context.WithoutCancel(ctx), fmt.Sprintf("DROP TABLE IF EXISTS %s", tableName)); err != nil {
 			t.Errorf("failed to drop table %s: %v", tableName, err)
 		}
-	}
+	})
+	return tableName, func(*testing.T) { teardown() }
 }
 
 func GetPostgresVectorSearchStmts(vectorTableName string) (string, string) {

@@ -129,6 +129,8 @@ func TestAlloyDBPgToolEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unable to create AlloyDB connection pool: %s", err)
 	}
+	// Registered first so it runs last, after every other cleanup that uses the pool.
+	t.Cleanup(pool.Close)
 
 	// Generate a unique ID
 	uniqueID := strings.ReplaceAll(uuid.New().String(), "-", "")
@@ -142,6 +144,8 @@ func TestAlloyDBPgToolEndpoints(t *testing.T) {
 	tableNameParam := "param_table_" + uniqueID
 	tableNameAuth := "auth_table_" + uniqueID
 	tableNameTemplateParam := "template_param_table_" + uniqueID
+	// Per-run name so concurrent runs do not collide; matches the cleanup sweep.
+	tableNameExecSql := "exec_sql_table_" + uniqueID
 
 	// set up data for param tool
 	createParamTableStmt, insertParamTableStmt, paramToolStmt, idParamToolStmt, nameParamToolStmt, arrayToolStmt, paramTestParams := tests.GetPostgresSQLParamToolInfo(tableNameParam)
@@ -184,13 +188,14 @@ func TestAlloyDBPgToolEndpoints(t *testing.T) {
 	}
 
 	// Get configs for tests
-	select1Want, failInvocationWant, createTableStatement, mcpSelect1Want := tests.GetPostgresWants()
+	select1Want, failInvocationWant, _, mcpSelect1Want := tests.GetPostgresWants()
+	createTableStatement := tests.GetPostgresExecuteSqlCreateTableStatement(tableNameExecSql)
 
 	// Run tests
 	tests.RunToolGetTest(t)
 	tests.RunToolInvokeTest(t, select1Want)
 	tests.RunMCPToolCallMethod(t, failInvocationWant, mcpSelect1Want)
-	tests.RunExecuteSqlToolInvokeTest(t, createTableStatement, select1Want)
+	tests.RunExecuteSqlToolInvokeTest(t, createTableStatement, select1Want, tests.WithExecuteSqlTableName(tableNameExecSql))
 	tests.RunToolInvokeWithTemplateParameters(t, tableNameTemplateParam)
 
 	// Run Postgres prebuilt tool tests
@@ -362,6 +367,21 @@ func TestAlloyDBPg_ReadOnlyVulnerabilityBlock(t *testing.T) {
 
 	uniqueID := strings.ReplaceAll(uuid.New().String(), "-", "")
 	tableName := "vulnerability_test_" + uniqueID
+
+	// The write tool must be rejected, but if read-only enforcement ever
+	// regresses the table would be created on the shared instance. Drop it
+	// through a separate (read-write) connection after the test.
+	t.Cleanup(func() {
+		pool, err := initAlloyDBPgConnectionPool(AlloyDBPostgresProject, AlloyDBPostgresRegion, AlloyDBPostgresCluster, AlloyDBPostgresInstance, "public", AlloyDBPostgresUser, AlloyDBPostgresPass, AlloyDBPostgresDatabase)
+		if err != nil {
+			t.Errorf("unable to create AlloyDB connection pool for cleanup: %s", err)
+			return
+		}
+		defer pool.Close()
+		if _, err := pool.Exec(context.Background(), fmt.Sprintf("DROP TABLE IF EXISTS %s", tableName)); err != nil {
+			t.Errorf("unable to drop %s: %s", tableName, err)
+		}
+	})
 
 	toolsFile := map[string]any{
 		"sources": map[string]any{

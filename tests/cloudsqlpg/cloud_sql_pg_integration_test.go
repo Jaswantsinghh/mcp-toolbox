@@ -113,6 +113,8 @@ func TestCloudSQLPgSimpleToolEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unable to create Cloud SQL connection pool: %s", err)
 	}
+	// Registered first so it runs last, after every other cleanup that uses the pool.
+	t.Cleanup(pool.Close)
 
 	// Generate a unique ID
 	uniqueID := strings.ReplaceAll(uuid.New().String(), "-", "")
@@ -126,6 +128,8 @@ func TestCloudSQLPgSimpleToolEndpoints(t *testing.T) {
 	tableNameParam := "param_table_" + uniqueID
 	tableNameAuth := "auth_table_" + uniqueID
 	tableNameTemplateParam := "template_param_table_" + uniqueID
+	// Per-run name so concurrent runs do not collide; matches the cleanup sweep.
+	tableNameExecSql := "exec_sql_table_" + uniqueID
 
 	// set up data for param tool
 	createParamTableStmt, insertParamTableStmt, paramToolStmt, idParamToolStmt, nameParamToolStmt, arrayToolStmt, paramTestParams := tests.GetPostgresSQLParamToolInfo(tableNameParam)
@@ -167,13 +171,14 @@ func TestCloudSQLPgSimpleToolEndpoints(t *testing.T) {
 	}
 
 	// Get configs for tests
-	select1Want, mcpMyFailToolWant, createTableStatement, mcpSelect1Want := tests.GetPostgresWants()
+	select1Want, mcpMyFailToolWant, _, mcpSelect1Want := tests.GetPostgresWants()
+	createTableStatement := tests.GetPostgresExecuteSqlCreateTableStatement(tableNameExecSql)
 
 	// Run tests
 	tests.RunToolGetTest(t)
 	tests.RunToolInvokeTest(t, select1Want)
 	tests.RunMCPToolCallMethod(t, mcpMyFailToolWant, mcpSelect1Want)
-	tests.RunExecuteSqlToolInvokeTest(t, createTableStatement, select1Want)
+	tests.RunExecuteSqlToolInvokeTest(t, createTableStatement, select1Want, tests.WithExecuteSqlTableName(tableNameExecSql))
 	tests.RunToolInvokeWithTemplateParameters(t, tableNameTemplateParam)
 
 	// Run Postgres prebuilt tool tests

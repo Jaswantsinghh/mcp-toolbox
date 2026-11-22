@@ -22,6 +22,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -656,6 +657,14 @@ func GetMySQLTmplToolStatement() (string, string) {
 	return tmplSelectCombined, tmplSelectFilterCombined
 }
 
+// GetPostgresExecuteSqlCreateTableStatement returns the CREATE TABLE statement
+// used by RunExecuteSqlToolInvokeTest for Postgres-compatible databases. Pass a
+// per-run (UUID-suffixed) table name together with WithExecuteSqlTableName so
+// concurrent runs against a shared instance do not collide on a fixed name.
+func GetPostgresExecuteSqlCreateTableStatement(tableName string) string {
+	return fmt.Sprintf(`"CREATE TABLE %s (id SERIAL PRIMARY KEY, name TEXT)"`, tableName)
+}
+
 // GetPostgresWants return the expected wants for postgres
 func GetPostgresWants() (string, string, string, string) {
 	select1Want := "[{\"?column?\":1}]"
@@ -685,31 +694,44 @@ func GetMySQLWants() (string, string, string, string) {
 
 // SetupPostgresSQLTable creates and inserts data into a table of tool
 // compatible with postgres-sql tool
+//
+// The drop is registered with t.Cleanup as soon as the table is created, so the
+// table is removed even if the insert fails. The returned teardown is
+// idempotent and may still be called (or deferred) by the caller.
 func SetupPostgresSQLTable(t *testing.T, ctx context.Context, pool *pgxpool.Pool, createStatement, insertStatement, tableName string, params []any) func(*testing.T) {
-	err := pool.Ping(ctx)
-	if err != nil {
+	t.Helper()
+	if err := pool.Ping(ctx); err != nil {
 		t.Fatalf("unable to connect to test database: %s", err)
 	}
 
-	// Create table
-	_, err = pool.Query(ctx, createStatement)
-	if err != nil {
+	// Create table. Exec (not Query) so no rows are left open on the pool.
+	if _, err := pool.Exec(ctx, createStatement); err != nil {
 		t.Fatalf("unable to create test table %s: %s", tableName, err)
 	}
+	teardown := RegisterTeardown(t, func() {
+		if _, err := pool.Exec(context.WithoutCancel(ctx), fmt.Sprintf("DROP TABLE IF EXISTS %s;", tableName)); err != nil {
+			t.Errorf("Teardown failed: %s", err)
+		}
+	})
 
 	// Insert test data
-	_, err = pool.Query(ctx, insertStatement, params...)
-	if err != nil {
+	if _, err := pool.Exec(ctx, insertStatement, params...); err != nil {
 		t.Fatalf("unable to insert test data: %s", err)
 	}
 
-	return func(t *testing.T) {
-		// tear down test
-		_, err = pool.Exec(context.WithoutCancel(ctx), fmt.Sprintf("DROP TABLE %s;", tableName))
-		if err != nil {
-			t.Errorf("Teardown failed: %s", err)
-		}
-	}
+	return func(*testing.T) { teardown() }
+}
+
+// RegisterTeardown registers fn with t.Cleanup and returns an idempotent
+// wrapper around it. Setup helpers call it right after creating an object so
+// the object is removed even if a later setup step calls t.Fatal, while callers
+// can still run the returned function early (e.g. via defer).
+func RegisterTeardown(t *testing.T, fn func()) func() {
+	t.Helper()
+	var once sync.Once
+	run := func() { once.Do(fn) }
+	t.Cleanup(run)
+	return run
 }
 
 // SetupMsSQLTable creates and inserts data into a table of tool
@@ -1036,9 +1058,9 @@ func CleanupPostgresTables(t *testing.T, ctx context.Context, pool *pgxpool.Pool
 		AND table_name LIKE $1;`
 	rows, err := pool.Query(ctx, query, "%\\_"+uniqueID)
 	if err != nil {
-		t.Fatalf("Failed to query for tables for uniqueID %s in 'public' schema: %v", uniqueID, err)
+		t.Errorf("Failed to query for tables for uniqueID %s in 'public' schema: %v", uniqueID, err)
+		return
 	}
-	defer rows.Close()
 
 	var tablesToDrop []string
 	for rows.Next() {
@@ -1048,6 +1070,10 @@ func CleanupPostgresTables(t *testing.T, ctx context.Context, pool *pgxpool.Pool
 			continue
 		}
 		tablesToDrop = append(tablesToDrop, fmt.Sprintf("public.%q", tableName))
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Errorf("Failed to iterate tables for uniqueID %s: %v", uniqueID, err)
 	}
 
 	if len(tablesToDrop) == 0 {
@@ -1060,7 +1086,7 @@ func CleanupPostgresTables(t *testing.T, ctx context.Context, pool *pgxpool.Pool
 	dropQuery := fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE;", strings.Join(tablesToDrop, ", "))
 
 	if _, err := pool.Exec(ctx, dropQuery); err != nil {
-		t.Fatalf("Failed to drop tables for uniqueID %s in 'public' schema: %v", uniqueID, err)
+		t.Errorf("Failed to drop tables for uniqueID %s in 'public' schema: %v", uniqueID, err)
 	} else {
 		t.Logf("INTEGRATION CLEANUP SUCCESS: Wiped all tables for uniqueID: %s", uniqueID)
 	}
