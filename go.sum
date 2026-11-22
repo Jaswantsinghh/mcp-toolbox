@@ -561,6 +561,8 @@ github.com/testcontainers/testcontainers-go/modules/cockroachdb v0.45.0 h1:bgXR9
 github.com/testcontainers/testcontainers-go/modules/cockroachdb v0.45.0/go.mod h1:VmcdduNIyqieGoS4mZHwXK9yTabLiXR7AIImaN+u+vY=
 github.com/testcontainers/testcontainers-go/modules/couchbase v0.45.0 h1:2IJdAG8B2JOB1GIUNAyC2pm+uaQlN1r3IzsNtowWeG0=
 github.com/testcontainers/testcontainers-go/modules/couchbase v0.45.0/go.mod h1:KiBhSyHNFeAdoAxkzu/wwn2rtOuR22NbEPxlOSmssQQ=
+github.com/testcontainers/testcontainers-go/modules/gcloud v0.45.0 h1:E54SO2VuMb/OnYjDaFkve8kUHet/QSEmgh7AwsHGmJo=
+github.com/testcontainers/testcontainers-go/modules/gcloud v0.45.0/go.mod h1:xJOgV5vmC5RKbwVyQHtm3PxM3banswN9YhblxBaD//s=
 github.com/testcontainers/testcontainers-go/modules/mongodb v0.45.0 h1:lOeoea1MnafesDCZ3AxmH1BbHWKpTlRM2x4HAogPHX8=
 github.com/testcontainers/testcontainers-go/modules/mongodb v0.45.0/go.mod h1:U6l6ppAf5SGoZMzL8dFWFmiJ79qNUr7Fj5BX2TrMeAw=
 github.com/testcontainers/testcontainers-go/modules/scylladb v0.45.0 h1:t+jvagQN0k1pR40QFHAj7LdvzvH0/+sivDLaYM1o0Gc=
